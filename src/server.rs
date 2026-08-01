@@ -1,12 +1,14 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, Content};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use serde_json::Value;
 
 use crate::model::*;
 use crate::report;
-use crate::youtrack::YouTrack;
+use crate::youtrack::{strip_url, Resolved, YouTrack, LIST_TOP};
 
 #[derive(Clone)]
 pub struct Server {
@@ -31,6 +33,12 @@ fn strip_noise(v: &mut Value) {
 fn ok(mut v: Value) -> Result<String, ErrorData> {
     strip_noise(&mut v);
     Ok(serde_json::to_string(&v).unwrap_or_else(|_| "null".into()))
+}
+
+/// Same payload as [`ok`], as a full result — for tools that may also return
+/// non-text content.
+fn ok_result(v: Value) -> Result<CallToolResult, ErrorData> {
+    Ok(CallToolResult::success(vec![Content::text(ok(v)?)]))
 }
 
 fn req<'a>(v: &'a Option<String>, msg: &str) -> Result<&'a str, ErrorData> {
@@ -236,61 +244,208 @@ impl Server {
         ok(v)
     }
 
-    #[tool(description = "Issue attachments: op list|get|upload|download|delete. Upload via contentBase64; download returns base64 unless path given.")]
-    async fn attachment(&self, Parameters(a): Parameters<AttachmentArg>) -> Result<String, ErrorData> {
+    #[tool(description = "Attachments of an issue (default) or article: op list|get|upload|download|delete. Target by 'attachmentId' or by 'name' (an ambiguous name errors with the candidate ids). Upload via contentBase64 or path. Download: an image is returned as a viewable image; anything else is written to disk ('path', else YOUTRACK_DOWNLOAD_DIR, else temp) and the path returned — read it with the file-reading tool.")]
+    async fn attachment(
+        &self,
+        Parameters(a): Parameters<AttachmentArg>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let entity = a.entity.unwrap_or(Entity::Issue);
+        let verbose = a.verbose.unwrap_or(false);
+        let parent = a.parent_id.as_str();
+        let top = a.top.unwrap_or(LIST_TOP).max(1);
         let v = match a.op {
-            AttachOp::List => self.yt.attachments_list(&a.issue_id).await?,
+            AttachOp::List => self.yt.attachments_list(entity, parent, top, verbose).await?,
             AttachOp::Get => {
-                let aid = req(&a.attachment_id, "attachment op=get requires 'attachmentId'")?;
-                self.yt.attachment_get(&a.issue_id, aid).await?
+                let r = self.resolve(entity, parent, &a, top).await?;
+                let mut v = self.yt.attachment_meta(entity, parent, r).await?;
+                if !verbose {
+                    strip_url(&mut v);
+                }
+                v
             }
             AttachOp::Upload => {
                 let name = req(&a.name, "attachment op=upload requires 'name'")?;
                 let bytes = if let Some(b64) = &a.content_base64 {
                     YouTrack::b64_decode(b64).map_err(ErrorData::from)?
                 } else if let Some(p) = &a.path {
-                    std::fs::read(p)
+                    tokio::fs::read(p)
+                        .await
                         .map_err(|e| ErrorData::invalid_params(format!("read {p}: {e}"), None))?
                 } else {
                     return Err(ErrorData::invalid_params("contentBase64 or path required", None));
                 };
-                self.yt.attachment_upload(&a.issue_id, name, bytes).await?
+                let mut v = self.yt.attachment_upload(entity, parent, name, bytes).await?;
+                if !verbose {
+                    strip_url(&mut v);
+                }
+                v
             }
             AttachOp::Download => {
-                let aid = req(&a.attachment_id, "attachment op=download requires 'attachmentId'")?;
-                let (name, bytes) = self.yt.attachment_download(&a.issue_id, aid).await?;
-                let target = a.path.clone().or_else(|| {
-                    self.yt
-                        .cfg
-                        .download_dir
-                        .as_ref()
-                        .map(|d| format!("{}/{}", d.trim_end_matches('/'), name))
-                });
-                match target {
-                    Some(path) => {
-                        std::fs::write(&path, &bytes)
-                            .map_err(|e| ErrorData::internal_error(format!("write {path}: {e}"), None))?;
-                        serde_json::json!({"saved": path, "bytes": bytes.len()})
-                    }
-                    None => serde_json::json!({
-                        "name": name,
-                        "bytes": bytes.len(),
-                        "contentBase64": YouTrack::b64_encode(&bytes)
-                    }),
-                }
+                let r = self.resolve(entity, parent, &a, top).await?;
+                let meta = self.yt.attachment_meta(entity, parent, r).await?;
+                let (name, mime, bytes) = self.yt.attachment_download(&meta).await?;
+                return self.deliver_download(a.path.as_deref(), name, mime, bytes).await;
             }
             AttachOp::Delete => {
-                let aid = req(&a.attachment_id, "attachment op=delete requires 'attachmentId'")?;
-                self.yt.attachment_delete(&a.issue_id, aid).await?
+                let r = self.resolve(entity, parent, &a, top).await?;
+                self.yt.attachment_delete(entity, parent, &r.id).await?
             }
         };
-        ok(v)
+        ok_result(v)
     }
+}
+
+/// Cap on inlining a downloaded image as a content block. Beyond this the file
+/// goes to disk instead. Base64 on the wire plus the serialized copy peaks at
+/// several times the file size, so this bounds that peak; for scale, the
+/// largest attachment on the busiest issue tested was 393 KB.
+const INLINE_IMAGE_MAX: usize = 4 * 1024 * 1024;
+
+impl Server {
+    /// Resolve `attachmentId`/`name` to an attachment, reporting a missing
+    /// reference the way every other tool does — naming the op that needs it.
+    async fn resolve(
+        &self,
+        entity: Entity,
+        parent: &str,
+        a: &AttachmentArg,
+        top: i64,
+    ) -> Result<Resolved, ErrorData> {
+        if a.attachment_id.is_none() && a.name.is_none() {
+            return Err(ErrorData::invalid_params(
+                format!("attachment op={} requires 'attachmentId' or 'name'", a.op.as_str()),
+                None,
+            ));
+        }
+        Ok(self
+            .yt
+            .attachment_resolve(entity, parent, a.attachment_id.as_deref(), a.name.as_deref(), top)
+            .await?)
+    }
+
+    /// Hand a downloaded file to the caller in the form it can actually use: an
+    /// image as a real image block it can look at, anything else as a file on
+    /// disk. Base64 in a text result was neither — it blew up the context and
+    /// stayed unreadable.
+    async fn deliver_download(
+        &self,
+        requested_path: Option<&str>,
+        name: String,
+        mime: String,
+        bytes: Vec<u8>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if should_inline_image(requested_path.is_some(), &mime, bytes.len()) {
+            let summary =
+                serde_json::json!({"name": name, "bytes": bytes.len(), "mimeType": mime});
+            return Ok(CallToolResult::success(vec![
+                Content::text(ok(summary)?),
+                Content::image(YouTrack::b64_encode(&bytes), mime),
+            ]));
+        }
+
+        let path = match requested_path {
+            // Caller-chosen target: written as given, but its directory is NOT
+            // created. The name that lands here can be steered by whatever the
+            // model just read from an issue, and creating missing parents turns
+            // "write fails" into "write anywhere" (~/Library/LaunchAgents/…).
+            // An operator pointing at a real directory is unaffected.
+            Some(p) => PathBuf::from(p),
+            None => {
+                let dir = self
+                    .yt
+                    .cfg
+                    .download_dir
+                    .as_ref()
+                    .map_or_else(std::env::temp_dir, PathBuf::from);
+                // This root comes from env, not from the model, so creating it
+                // is safe; the file name within it is separator-stripped.
+                tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+                    ErrorData::internal_error(format!("create {}: {e}", dir.display()), None)
+                })?;
+                dir.join(sanitize_file_name(&name))
+            }
+        };
+        tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("write {}: {e}", path.display()), None))?;
+        ok_result(serde_json::json!({
+            "saved": path.to_string_lossy(),
+            "bytes": bytes.len(),
+            "mimeType": mime,
+        }))
+    }
+}
+
+/// Inline only what the caller can actually look at, and only when they did not
+/// ask for a file: an explicit `path` is a request to put the bytes there.
+fn should_inline_image(explicit_path: bool, mime: &str, len: usize) -> bool {
+    !explicit_path && mime.starts_with("image/") && len <= INLINE_IMAGE_MAX
+}
+
+/// Keep a YouTrack-supplied file name from escaping the download directory —
+/// it is attacker-controlled in the sense that anyone who can attach a file
+/// picks it. Separators and parent refs are the only things that matter here.
+fn sanitize_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if std::path::is_separator(c) || c == '\0' { '_' } else { c })
+        .collect();
+    if cleaned.trim().trim_matches('.').is_empty() {
+        return "attachment".to_string();
+    }
+    cleaned
 }
 
 #[tool_handler(
     name = "youtrack-mcp",
-    version = "0.1.0",
+    // `version` deliberately omitted: the macro then reports CARGO_PKG_VERSION.
+    // It used to be hardcoded and drifted to 0.1.0 while the crate was at 0.1.3,
+    // so the handshake could not tell a client which build it had connected to.
     instructions = "Lean YouTrack MCP. Conventions: issue ids are readable like ABC-123 (bare numbers expand via YOUTRACK_DEFAULT_PROJECT). For parent/child use issue_write.parentId (native subtask) — NOT link_write. link_write needs sourceId+targetId+linkType (name e.g. 'Relates','Depend') and role outward|inward for directed types. Dates are ISO YYYY-MM-DD. tags must already exist (this server never creates tags; unknown tag = error). issue_write op=delete permanently deletes the issue. workitem_write needs date+minutes (+type name like 'Разработка'); idempotent=true skips a same issue+date+description entry. workitems_list/report default to the current user. Errors are returned as JSON-RPC errors whose message states the missing/invalid field and the fix; 'YouTrack <status>: <msg>' means the API rejected the call."
 )]
 impl ServerHandler for Server {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_file_name_neutralises_traversal() {
+        assert_eq!(sanitize_file_name("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(sanitize_file_name(".."), "attachment");
+        assert_eq!(sanitize_file_name("   "), "attachment");
+    }
+
+    #[test]
+    fn sanitize_file_name_keeps_ordinary_names() {
+        assert_eq!(sanitize_file_name("image51.png"), "image51.png");
+        assert_eq!(sanitize_file_name("Иерархия 2.0.txt"), "Иерархия 2.0.txt");
+    }
+
+    #[test]
+    fn inlines_a_small_image_without_an_explicit_path() {
+        assert!(should_inline_image(false, "image/png", 1024));
+    }
+
+    #[test]
+    fn does_not_inline_when_a_path_was_requested() {
+        assert!(!should_inline_image(true, "image/png", 1024));
+    }
+
+    #[test]
+    fn does_not_inline_a_non_image() {
+        assert!(!should_inline_image(false, "application/pdf", 1024));
+    }
+
+    #[test]
+    fn does_not_inline_an_oversized_image() {
+        assert!(!should_inline_image(false, "image/png", INLINE_IMAGE_MAX + 1));
+    }
+
+    #[test]
+    fn strip_noise_removes_type_keys_recursively() {
+        let mut v = serde_json::json!({"$type": "Issue", "a": {"$type": "X", "b": 1}});
+        strip_noise(&mut v);
+        assert_eq!(v, serde_json::json!({"a": {"b": 1}}));
+    }
+}

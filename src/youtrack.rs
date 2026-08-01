@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
+use crate::model::Entity;
 
 const F_ISSUE: &str = "id,idReadable,summary,description,usesMarkdown,created,updated,resolved,project(id,shortName,name),parent(issues(idReadable,summary)),assignee(id,login,name),reporter(id,login,name),tags(id,name),customFields(id,name,value(id,login,name,presentation),$type)";
 const F_ISSUE_SHORT: &str = "id,idReadable,summary,project(shortName),customFields(name,value(name,login,presentation),$type)";
@@ -20,13 +21,29 @@ const F_ARTICLE_LIST: &str = "id,idReadable,summary,parentArticle(id,idReadable)
 const F_WORKITEM: &str = "id,date,updated,duration(minutes,presentation),text,description,usesMarkdown,type(id,name),issue(id,idReadable),author(id,login,name)";
 const F_USERS: &str = "id,login,name,fullName,email";
 const F_PROJECTS: &str = "id,shortName,name";
+/// `url` is a pre-signed, bearer-equivalent link and is the bulk of the payload
+/// (~60% of a list response), so it is fetched but stripped unless `verbose`.
 const F_ATTACH: &str = "id,name,author(login),created,size,mimeType,url,extension";
+/// Page size for collection endpoints. YouTrack's own default is 42 and it
+/// truncates to that silently — no marker, no count — so every collection
+/// states its own ceiling instead of inheriting one. Nothing realistic
+/// exceeds this.
+pub(crate) const LIST_TOP: i64 = 500;
 const F_ACTIVITY: &str = "id,timestamp,author(login,name),category(id),target(text,issue(idReadable,summary)),added(name,login),removed(name,login)";
 const ACTIVITY_DEFAULT_CATEGORIES: &str = "CustomFieldCategory,CommentsCategory";
+
+/// Transport settings shared by every client this server builds.
+fn client_builder() -> reqwest::ClientBuilder {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(15))
+}
 
 pub struct YouTrack {
     pub cfg: Config,
     http: Client,
+    /// Follows redirects; see `YouTrack::new`.
+    http_files: Client,
     link_types: RwLock<Vec<Value>>,
     projects: RwLock<HashMap<String, String>>,
     work_types: RwLock<HashMap<String, String>>,
@@ -61,17 +78,81 @@ fn name_or_id_eq(node: &Value, needle: &str) -> bool {
     })
 }
 
-/// Comma-joined quoted `name`s of agile/sprint nodes, for "valid values"
-/// hints in resolution errors. A board exposes only its own sprints, so
-/// callers can't know the accepted set up front — surface it on failure.
-fn node_names(nodes: &[Value]) -> String {
-    let joined = nodes
+/// Comma-joined quoted `name`s, for the "valid values" hint in a resolution
+/// error — a caller can't know the accepted set up front (a board exposes only
+/// its own sprints; attachment names are whatever was uploaded), so it is
+/// surfaced on failure. `cap` bounds long lists, and states how many it cut:
+/// a silently short list is what sent callers guessing ids in the first place.
+fn quoted_names(nodes: &[Value], cap: Option<usize>) -> String {
+    let names: Vec<&str> =
+        nodes.iter().filter_map(|n| n.get("name").and_then(Value::as_str)).collect();
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    let cap = cap.unwrap_or(names.len());
+    let shown =
+        names.iter().take(cap).map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+    match names.len().saturating_sub(cap) {
+        0 => shown,
+        rest => format!("{shown} … and {rest} more"),
+    }
+}
+
+/// Drop the pre-signed `url`: it grants access to the file on its own, so it
+/// does not belong in output an LLM will echo into logs and transcripts.
+/// Recurses, because an upload answers with an *array* of created attachments —
+/// stripping only a top-level object would silently miss it.
+pub(crate) fn strip_url(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            map.remove("url");
+            map.values_mut().for_each(strip_url);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_url),
+        _ => {}
+    }
+}
+
+/// Stringify an attachment field for error messages; numbers included, since
+/// `size` arrives as a JSON number.
+fn attach_str(node: &Value, key: &str) -> String {
+    match node.get(key) {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => "?".to_string(),
+    }
+}
+
+/// Attachments whose `name` matches `needle`. Exact match wins; only if nothing
+/// matches exactly is the trimmed/case-folded comparison tried, so `a.PNG` can
+/// never shadow a literal `a.png` that exists alongside it.
+fn match_by_name<'a>(items: &'a [Value], needle: &str) -> Vec<&'a Value> {
+    let exact: Vec<&Value> =
+        items.iter().filter(|a| a.get("name").and_then(Value::as_str) == Some(needle)).collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    let want = needle.trim().to_lowercase();
+    items
         .iter()
-        .filter_map(|n| n.get("name").and_then(Value::as_str))
-        .map(|n| format!("\"{n}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if joined.is_empty() { "none".to_string() } else { joined }
+        .filter(|a| {
+            a.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n.trim().to_lowercase() == want)
+        })
+        .collect()
+}
+
+/// How many attachment names a "no such name" error lists before cutting.
+const NAMES_IN_ERROR: usize = 40;
+
+/// An attachment reference resolved to an id.
+pub struct Resolved {
+    pub id: String,
+    /// The listing row, present only when the id came from a name lookup.
+    /// Carries the same fields a per-id GET returns, so callers reuse it
+    /// instead of asking YouTrack for what they already have.
+    pub meta: Option<Value>,
 }
 
 impl YouTrack {
@@ -84,15 +165,22 @@ impl YouTrack {
                 .map_err(|_| AppError::Config("invalid token".into()))?,
         );
         headers.insert(reqwest::header::ACCEPT, "application/json".parse().unwrap());
-        let http = Client::builder()
-            .default_headers(headers)
+        let http = client_builder()
+            .default_headers(headers.clone())
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(60))
-            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()?;
+        // File downloads are the one place redirects are expected: YouTrack
+        // Cloud answers /api/files/… with a 302 to object storage. reqwest
+        // follows them and strips Authorization the moment host-or-port
+        // changes, which is stricter than a host-only check would be.
+        let http_files = client_builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::limited(5))
             .build()?;
         Ok(Arc::new(Self {
             cfg,
             http,
+            http_files,
             link_types: RwLock::new(vec![]),
             projects: RwLock::new(HashMap::new()),
             work_types: RwLock::new(HashMap::new()),
@@ -181,6 +269,22 @@ impl YouTrack {
         [("fields", fields.to_string())]
     }
 
+    /// GET a collection with an explicit page size.
+    ///
+    /// Use this — never bare `get` — for any endpoint returning an array.
+    /// `get` is for single entities, where `$top` is meaningless and would also
+    /// arm its `has_page` 400-retry path for no reason. A saturated page is
+    /// warned about rather than passed off as a complete list.
+    async fn list(&self, path: &str, fields: &str, top: i64) -> Result<Value> {
+        let v = self
+            .get(path, &[("fields", fields.to_string()), ("$top", top.to_string())])
+            .await?;
+        if v.as_array().is_some_and(|a| a.len() as i64 >= top) {
+            tracing::warn!(path, top, "collection filled the page; results may be truncated");
+        }
+        Ok(v)
+    }
+
     // ---- resolvers / caches ----
 
     /// name→id resolver shared by projects/tags/work-item-types: bare ids pass
@@ -226,7 +330,15 @@ impl YouTrack {
 
     async fn user_value(&self, login: &str) -> Result<Value> {
         let login = self.cfg.resolve_alias(login).to_string();
-        let q = [("fields", "id,login,name".to_string()), ("query", login.clone())];
+        // Paged explicitly: on a truncated page the exact-login match can fall
+        // off the end, and the `arr.first()` fallback below would then resolve
+        // to a different user entirely — a silently wrong assignee, not a
+        // missing result.
+        let q = [
+            ("fields", "id,login,name".to_string()),
+            ("query", login.clone()),
+            ("$top", LIST_TOP.to_string()),
+        ];
         let res = self.get("/api/users", &q).await?;
         if let Some(arr) = res.as_array() {
             if let Some(u) = arr.iter().find(|u| u.get("login").and_then(|x| x.as_str()) == Some(&login)) {
@@ -261,7 +373,7 @@ impl YouTrack {
                 return Ok(t.clone());
             }
         }
-        let list = self.get("/api/issueLinkTypes", &self.fq(F_LINK_TYPES)).await?;
+        let list = self.list("/api/issueLinkTypes", F_LINK_TYPES, LIST_TOP).await?;
         let arr = list.as_array().cloned().unwrap_or_default();
         *self.link_types.write().await = arr.clone();
         arr.into_iter()
@@ -292,7 +404,7 @@ impl YouTrack {
 
     pub async fn issue_links(&self, id: &str) -> Result<Value> {
         let id = self.cfg.expand_issue_id(id);
-        self.get(&format!("/api/issues/{id}/links"), &self.fq(F_LINKS)).await
+        self.list(&format!("/api/issues/{id}/links"), F_LINKS, LIST_TOP).await
     }
 
     /// Resolve an existing tag name to its id. This server never creates tags;
@@ -310,7 +422,7 @@ impl YouTrack {
     /// sprint by name (or id) and POST into the sprint's issues collection.
     async fn set_board(&self, id_readable: &str, board: &str, sprint: Option<&str>) -> Result<()> {
         let resp = self
-            .get("/api/agiles", &self.fq("id,name,sprints(id,name)"))
+            .list("/api/agiles", "id,name,sprints(id,name)", LIST_TOP)
             .await?;
         let boards = resp.as_array().map(Vec::as_slice).unwrap_or(&[]);
         let agile = boards
@@ -319,7 +431,7 @@ impl YouTrack {
             .ok_or_else(|| {
                 AppError::Bad(format!(
                     "agile board not found: {board}. Available boards: {}",
-                    node_names(boards)
+                    quoted_names(boards, None)
                 ))
             })?;
         let aid = agile
@@ -335,7 +447,7 @@ impl YouTrack {
                 .ok_or_else(|| {
                     AppError::Bad(format!(
                         "sprint \"{s}\" not found on board {board}. Valid sprints: {}",
-                        node_names(sprints)
+                        quoted_names(sprints, None)
                     ))
                 })?
                 .to_string(),
@@ -352,7 +464,7 @@ impl YouTrack {
                 _ => {
                     return Err(AppError::Bad(format!(
                         "board {board} has multiple sprints; specify `sprint`. Valid sprints: {}",
-                        node_names(sprints)
+                        quoted_names(sprints, None)
                     )));
                 }
             },
@@ -533,23 +645,36 @@ impl YouTrack {
 
     // ---- comments ----
 
-    fn comment_root(&self, entity: crate::model::Entity, parent: &str) -> String {
+    /// Canonical id of an entity as YouTrack addresses it. Bare issue numbers
+    /// expand via the default project; article ids are already qualified.
+    fn entity_id(&self, entity: Entity, parent: &str) -> String {
         match entity {
-            crate::model::Entity::Issue => {
-                format!("/api/issues/{}/comments", self.cfg.expand_issue_id(parent))
-            }
-            crate::model::Entity::Article => format!("/api/articles/{parent}/comments"),
+            Entity::Issue => self.cfg.expand_issue_id(parent),
+            Entity::Article => parent.to_string(),
         }
     }
 
-    pub async fn comments_list(&self, entity: crate::model::Entity, parent: &str) -> Result<Value> {
-        self.get(&self.comment_root(entity, parent), &self.fq(F_COMMENT)).await
+    /// Path to a sub-collection (`comments`, `attachments`, …) of an entity.
+    fn entity_root(&self, entity: Entity, parent: &str, sub: &str) -> String {
+        let base = match entity {
+            Entity::Issue => "issues",
+            Entity::Article => "articles",
+        };
+        format!("/api/{base}/{}/{sub}", self.entity_id(entity, parent))
+    }
+
+    fn comment_root(&self, entity: Entity, parent: &str) -> String {
+        self.entity_root(entity, parent, "comments")
+    }
+
+    pub async fn comments_list(&self, entity: Entity, parent: &str) -> Result<Value> {
+        self.list(&self.comment_root(entity, parent), F_COMMENT, LIST_TOP).await
     }
 
     /// Create (comment_id None) or update (Some) a comment on an issue/article.
     pub async fn comment_write(
         &self,
-        entity: crate::model::Entity,
+        entity: Entity,
         parent: &str,
         comment_id: Option<&str>,
         text: &str,
@@ -914,53 +1039,133 @@ impl YouTrack {
     }
 
     pub async fn meta_projects(&self) -> Result<Value> {
-        self.get("/api/admin/projects", &[("fields", F_PROJECTS.to_string()), ("$top", "500".to_string())]).await
+        self.list("/api/admin/projects", F_PROJECTS, LIST_TOP).await
     }
 
     pub async fn meta_link_types(&self) -> Result<Value> {
-        self.get("/api/issueLinkTypes", &self.fq(F_LINK_TYPES)).await
+        self.list("/api/issueLinkTypes", F_LINK_TYPES, LIST_TOP).await
     }
 
     pub async fn meta_work_types(&self, project: Option<&str>) -> Result<Value> {
         match project {
             Some(p) => {
                 let pid = self.project_id(p).await?;
-                self.get(
+                self.list(
                     &format!("/api/admin/projects/{pid}/timeTrackingSettings/workItemTypes"),
-                    &self.fq("id,name"),
+                    "id,name",
+                    LIST_TOP,
                 )
                 .await
             }
             None => {
-                self.get("/api/admin/timeTrackingSettings/workItemTypes", &self.fq("id,name")).await
+                self.list("/api/admin/timeTrackingSettings/workItemTypes", "id,name", LIST_TOP).await
             }
         }
     }
 
     // ---- attachments ----
 
-    pub async fn attachments_list(&self, issue: &str) -> Result<Value> {
-        let issue = self.cfg.expand_issue_id(issue);
-        self.get(&format!("/api/issues/{issue}/attachments"), &self.fq(F_ATTACH)).await
+    fn attach_root(&self, entity: Entity, parent: &str) -> String {
+        self.entity_root(entity, parent, "attachments")
     }
 
-    pub async fn attachment_get(&self, issue: &str, aid: &str) -> Result<Value> {
-        let issue = self.cfg.expand_issue_id(issue);
-        self.get(&format!("/api/issues/{issue}/attachments/{aid}"), &self.fq(F_ATTACH)).await
+    /// Raw listing, always paged explicitly — YouTrack's implicit default cuts
+    /// off at 42 with nothing in the response saying so.
+    async fn attachments_raw(&self, entity: Entity, parent: &str, top: i64) -> Result<Vec<Value>> {
+        let v = self.list(&self.attach_root(entity, parent), F_ATTACH, top).await?;
+        match v {
+            Value::Array(a) => Ok(a),
+            other => Err(AppError::Bad(format!("expected attachment array, got {other}"))),
+        }
+    }
+
+    pub async fn attachments_list(
+        &self,
+        entity: Entity,
+        parent: &str,
+        top: i64,
+        verbose: bool,
+    ) -> Result<Value> {
+        let mut items = self.attachments_raw(entity, parent, top).await?;
+        // A full page means YouTrack may be holding more back; say so rather
+        // than letting the caller read a cut-off list as complete.
+        let truncated = items.len() as i64 >= top;
+        if !verbose {
+            items.iter_mut().for_each(strip_url);
+        }
+        Ok(json!({"count": items.len(), "truncated": truncated, "attachments": items}))
+    }
+
+    pub async fn attachment_get(&self, entity: Entity, parent: &str, aid: &str) -> Result<Value> {
+        self.get(&format!("{}/{aid}", self.attach_root(entity, parent)), &self.fq(F_ATTACH)).await
+    }
+
+    /// Resolve an attachment reference. `aid` wins; otherwise `name` is matched
+    /// against the listing. Names are NOT unique — YouTrack auto-names pasted
+    /// screenshots per entity, and Culture-435 carries both "image25.png" and
+    /// "Иерархия 2.0.txt" twice — so a name resolves only when exactly one
+    /// attachment carries it, and an ambiguous one names the candidates.
+    pub async fn attachment_resolve(
+        &self,
+        entity: Entity,
+        parent: &str,
+        aid: Option<&str>,
+        name: Option<&str>,
+        top: i64,
+    ) -> Result<Resolved> {
+        if let Some(id) = aid {
+            return Ok(Resolved { id: id.to_string(), meta: None });
+        }
+        let Some(name) = name else {
+            return Err(AppError::Bad("requires 'attachmentId' or 'name'".into()));
+        };
+        let items = self.attachments_raw(entity, parent, top).await?;
+        let matches = match_by_name(&items, name);
+        match matches.as_slice() {
+            [one] => Ok(Resolved { id: attach_str(one, "id"), meta: Some((*one).clone()) }),
+            [] => Err(AppError::Bad(format!(
+                "no attachment named {name:?} on {parent}. Available: {}",
+                quoted_names(&items, Some(NAMES_IN_ERROR))
+            ))),
+            many => Err(AppError::Bad(format!(
+                "attachment name {name:?} is ambiguous on {parent} ({} matches: {}). \
+                 Pass 'attachmentId'.",
+                many.len(),
+                many.iter()
+                    .map(|a| format!("{} ({} bytes)", attach_str(a, "id"), attach_str(a, "size")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
+    /// Metadata for a resolved attachment, reusing the listing row when the id
+    /// came from a name lookup — that row already holds every field a per-id
+    /// GET would return, so re-fetching it is a wasted round trip.
+    pub async fn attachment_meta(
+        &self,
+        entity: Entity,
+        parent: &str,
+        r: Resolved,
+    ) -> Result<Value> {
+        match r.meta {
+            Some(v) => Ok(v),
+            None => self.attachment_get(entity, parent, &r.id).await,
+        }
     }
 
     pub async fn attachment_upload(
         &self,
-        issue: &str,
+        entity: Entity,
+        parent: &str,
         name: &str,
         bytes: Vec<u8>,
     ) -> Result<Value> {
-        let issue = self.cfg.expand_issue_id(issue);
         let part = reqwest::multipart::Part::bytes(bytes).file_name(name.to_string());
         let form = reqwest::multipart::Form::new().part(name.to_string(), part);
         let resp = self
             .http
-            .post(self.url(&format!("/api/issues/{issue}/attachments")))
+            .post(self.url(&self.attach_root(entity, parent)))
             .query(&[("fields", F_ATTACH)])
             .multipart(form)
             .send()
@@ -968,36 +1173,47 @@ impl YouTrack {
         self.check(resp).await
     }
 
-    pub async fn attachment_download(&self, issue: &str, aid: &str) -> Result<(String, Vec<u8>)> {
-        let meta = self.attachment_get(issue, aid).await?;
-        let name = meta
-            .get("name")
-            .and_then(|x| x.as_str())
-            .unwrap_or("attachment")
+    /// Returns `(name, mimeType, bytes)`.
+    pub async fn attachment_download(&self, meta: &Value) -> Result<(String, String, Vec<u8>)> {
+        let name = meta.get("name").and_then(Value::as_str).unwrap_or("attachment").to_string();
+        let mime = meta
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream")
             .to_string();
         let rel = meta
             .get("url")
-            .and_then(|x| x.as_str())
+            .and_then(Value::as_str)
             .ok_or_else(|| AppError::Bad("attachment has no url".into()))?;
         let full = if rel.starts_with("http") {
             rel.to_string()
         } else {
             format!("{}{}", self.cfg.base_url, rel)
         };
-        let resp = self.http.get(full).send().await?;
-        if !resp.status().is_success() {
+        Ok((name, mime, self.fetch_file(&full).await?))
+    }
+
+    async fn fetch_file(&self, url: &str) -> Result<Vec<u8>> {
+        let resp = self.http_files.get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
             return Err(AppError::Api {
-                status: resp.status().as_u16(),
+                status: status.as_u16(),
                 message: "attachment download failed".into(),
             });
         }
-        Ok((name, resp.bytes().await?.to_vec()))
+        Ok(resp.bytes().await?.to_vec())
     }
 
-    pub async fn attachment_delete(&self, issue: &str, aid: &str) -> Result<Value> {
-        let issue = self.cfg.expand_issue_id(issue);
-        self.delete(&format!("/api/issues/{issue}/attachments/{aid}")).await?;
-        Ok(json!({"deleted": true, "issueId": issue, "attachmentId": aid}))
+    pub async fn attachment_delete(&self, entity: Entity, parent: &str, aid: &str) -> Result<Value> {
+        self.delete(&format!("{}/{aid}", self.attach_root(entity, parent))).await?;
+        // Echo the id YouTrack actually addressed, not the shorthand we were
+        // handed — a caller passing "435" should see "Culture-435" back.
+        Ok(json!({
+            "deleted": true,
+            "parentId": self.entity_id(entity, parent),
+            "attachmentId": aid,
+        }))
     }
 
     pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
@@ -1034,14 +1250,14 @@ mod tests {
     }
 
     #[test]
-    fn node_names_quotes_joins_and_handles_empty() {
+    fn quoted_names_quotes_and_joins() {
         let nodes = vec![json!({"name": "Первый спринт"}), json!({"name": "2 Спринт"})];
-        assert_eq!(node_names(&nodes), "\"Первый спринт\", \"2 Спринт\"");
+        assert_eq!(quoted_names(&nodes, None), "\"Первый спринт\", \"2 Спринт\"");
     }
 
     #[test]
-    fn node_names_empty_is_none() {
-        assert_eq!(node_names(&[]), "none");
+    fn quoted_names_empty_is_none() {
+        assert_eq!(quoted_names(&[], None), "none");
     }
 
     #[test]
@@ -1049,5 +1265,119 @@ mod tests {
         let data = b"hello attach";
         let enc = YouTrack::b64_encode(data);
         assert_eq!(YouTrack::b64_decode(&enc).unwrap(), data);
+    }
+
+    fn attach(id: &str, name: &str) -> Value {
+        json!({"id": id, "name": name, "size": 10})
+    }
+
+    #[test]
+    fn match_by_name_finds_single_exact() {
+        let items = vec![attach("7-1", "a.png"), attach("7-2", "b.png")];
+        let hits = match_by_name(&items, "b.png");
+        assert_eq!(hits.iter().map(|h| attach_str(h, "id")).collect::<Vec<_>>(), ["7-2"]);
+    }
+
+    #[test]
+    fn match_by_name_falls_back_to_case_and_trim() {
+        let items = vec![attach("7-1", "Иерархия.txt")];
+        let hits = match_by_name(&items, "  иерархия.TXT ");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn match_by_name_prefers_exact_over_case_variant() {
+        let items = vec![attach("7-1", "a.PNG"), attach("7-2", "a.png")];
+        let hits = match_by_name(&items, "a.png");
+        assert_eq!(hits.iter().map(|h| attach_str(h, "id")).collect::<Vec<_>>(), ["7-2"]);
+    }
+
+    #[test]
+    fn match_by_name_reports_every_duplicate() {
+        // Real case: Culture-435 carries "Иерархия 2.0.txt" twice.
+        let items = vec![attach("7-1", "dup.txt"), attach("7-2", "dup.txt")];
+        assert_eq!(match_by_name(&items, "dup.txt").len(), 2);
+    }
+
+    #[test]
+    fn match_by_name_empty_on_miss() {
+        let items = vec![attach("7-1", "a.png")];
+        assert!(match_by_name(&items, "zzz.png").is_empty());
+    }
+
+    #[test]
+    fn quoted_names_lists_all_when_under_cap() {
+        let items = vec![attach("7-1", "a.png"), attach("7-2", "b.png")];
+        assert_eq!(quoted_names(&items, Some(NAMES_IN_ERROR)), "\"a.png\", \"b.png\"");
+    }
+
+    #[test]
+    fn quoted_names_states_how_many_it_cut() {
+        let items: Vec<Value> =
+            (0..45).map(|i| attach(&format!("7-{i}"), &format!("f{i}.png"))).collect();
+        assert!(quoted_names(&items, Some(NAMES_IN_ERROR)).ends_with("… and 5 more"));
+    }
+
+    #[test]
+    fn quoted_names_empty_is_none_when_capped() {
+        assert_eq!(quoted_names(&[], Some(NAMES_IN_ERROR)), "none");
+    }
+
+    #[test]
+    fn strip_url_drops_only_the_signed_link() {
+        let mut v = json!({"id": "7-1", "url": "/api/files/7-1?sign=secret"});
+        strip_url(&mut v);
+        assert_eq!(v, json!({"id": "7-1"}));
+    }
+
+    #[test]
+    fn strip_url_reaches_into_an_array() {
+        // An upload answers with an array of created attachments.
+        let mut v = json!([{"id": "7-1", "url": "?sign=a"}, {"id": "7-2", "url": "?sign=b"}]);
+        strip_url(&mut v);
+        assert_eq!(v, json!([{"id": "7-1"}, {"id": "7-2"}]));
+    }
+
+    #[test]
+    fn attach_str_stringifies_numbers() {
+        assert_eq!(attach_str(&json!({"size": 42}), "size"), "42");
+        assert_eq!(attach_str(&json!({}), "size"), "?");
+    }
+
+    fn yt(default_project: Option<&str>) -> Arc<YouTrack> {
+        YouTrack::new(Config {
+            base_url: "https://yt.example".into(),
+            token: "t".into(),
+            timezone: chrono_tz::Europe::Moscow,
+            default_project: default_project.map(String::from),
+            holidays: Default::default(),
+            pre_holidays: Default::default(),
+            user_aliases: Default::default(),
+            download_dir: None,
+        })
+        .expect("client builds")
+    }
+
+    #[test]
+    fn attach_root_routes_issues_and_expands_bare_ids() {
+        assert_eq!(
+            yt(Some("Culture")).attach_root(Entity::Issue, "435"),
+            "/api/issues/Culture-435/attachments"
+        );
+    }
+
+    #[test]
+    fn attach_root_routes_articles_verbatim() {
+        assert_eq!(
+            yt(None).attach_root(Entity::Article, "Culture-A-81"),
+            "/api/articles/Culture-A-81/attachments"
+        );
+    }
+
+    #[test]
+    fn entity_id_is_what_responses_should_echo() {
+        // A caller passing "435" gets the resolved id back, not its shorthand.
+        assert_eq!(yt(Some("Culture")).entity_id(Entity::Issue, "435"), "Culture-435");
+        assert_eq!(yt(None).entity_id(Entity::Article, "Culture-A-81"), "Culture-A-81");
     }
 }

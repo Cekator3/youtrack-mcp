@@ -6,7 +6,7 @@ Lean [Model Context Protocol](https://modelcontextprotocol.io) server for [YouTr
 
 A drop-in replacement for heavier YouTrack MCPs:
 
-- **~10× smaller tool schema** — 16 consolidated tools (~2.9k tokens in `tools/list`) instead of 50+ (~23k tokens). Less context burned on every request.
+- **~10× smaller tool schema** — 16 consolidated tools (~3.2k tokens in `tools/list`) instead of 50+ (~23k tokens). Less context burned on every request.
 - **Correct subtask hierarchy** — parent set reliably via the command API; the real parent issue is surfaced (not an opaque link id).
 - **Complete write surface** — tags, agile board/sprint, work-item type for time tracking, attachments, article + comment create/edit, issue delete.
 - **Safe by design** — never creates tags (only applies existing ones); secrets never leak into error messages.
@@ -32,7 +32,7 @@ A drop-in replacement for heavier YouTrack MCPs:
 | `activity` | Activity feed. `scope=issue` (needs `issueId`, optional author) \| `user` (needs author, defaults last 30d). Categories default to CustomFieldCategory, CommentsCategory. Dates ISO or unix ms. |
 | `users` | Users: `op` list (optional query) \| me \| get (by id). |
 | `meta` | Discovery: `kind` projects \| link_types \| work_item_types (optional project). |
-| `attachment` | Issue attachments: `op` list \| get \| upload \| download \| delete. Upload via `contentBase64`; download returns base64 unless a path is given. |
+| `attachment` | Attachments of an issue (`entity` defaults to `issue`) or article: `op` list \| get \| upload \| download \| delete. Target by `attachmentId` or `name`. Upload via `contentBase64` or `path`. Download hands back an image as a viewable image; anything else is written to disk and the path returned. |
 
 ---
 
@@ -93,7 +93,7 @@ mcp-bin caches a release and reuses it forever by default. To move to a newer re
 | `YOUTRACK_HOLIDAYS` | no | CSV ISO dates, skipped in `workitems_report` |
 | `YOUTRACK_PRE_HOLIDAYS` | no | CSV ISO dates, counted at 7/8 norm |
 | `YOUTRACK_USER_ALIASES` | no | CSV `alias:login` pairs |
-| `YOUTRACK_DOWNLOAD_DIR` | no | Default target dir for attachment download |
+| `YOUTRACK_DOWNLOAD_DIR` | no | Where non-inlined attachment downloads land (default: system temp dir) |
 
 ## Conventions
 

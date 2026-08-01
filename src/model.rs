@@ -304,13 +304,33 @@ pub enum AttachOp {
     Delete,
 }
 
+impl AttachOp {
+    /// The wire spelling, for error messages that name the failing op.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Get => "get",
+            Self::Upload => "upload",
+            Self::Download => "download",
+            Self::Delete => "delete",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AttachmentArg {
     pub op: AttachOp,
-    #[serde(rename = "issueId")]
-    pub issue_id: String,
+    /// Which entity owns the attachment. Defaults to `issue`.
+    #[serde(default)]
+    pub entity: Option<Entity>,
+    /// Issue or article id (bare number expanded via default project).
+    #[serde(rename = "parentId", alias = "issueId")]
+    pub parent_id: String,
+    /// Exact attachment id. For get/download/delete either this or `name`.
     #[serde(default, rename = "attachmentId")]
     pub attachment_id: Option<String>,
+    /// File name. Upload: the name to store under. get/download/delete:
+    /// resolved to an id — an ambiguous name errors with the candidate ids.
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default, rename = "contentBase64")]
@@ -318,4 +338,11 @@ pub struct AttachmentArg {
     /// Local source for upload, or target for download.
     #[serde(default)]
     pub path: Option<String>,
+    /// op=list page size. Default 500.
+    #[serde(default)]
+    pub top: Option<i64>,
+    /// Include the signed `url` field in list/get output. Off by default: it is
+    /// a bearer-equivalent link and the bulk of the payload.
+    #[serde(default)]
+    pub verbose: Option<bool>,
 }
